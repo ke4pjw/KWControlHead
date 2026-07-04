@@ -1,0 +1,13 @@
+# Parallax's copyrighted Spin2 documentation — reference only, not ours to redistribute
+Parallax Spin2 Documentation v54.docx
+
+# Local Claude Code settings (machine-specific absolute paths)
+.claude/
+
+# Build / run artifacts
+TMD700_MITM_Top.log
+*.binary
+*.bin
+*.p2asm
+*.lst
+p2_port.cache

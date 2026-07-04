@@ -1,0 +1,352 @@
+'' =================================================================================================
+''
+''   File....... TMD700_MITM_Top.spin2
+''   Purpose.... Kenwood TM-D700 head<->body UART MITM bridge  (Parallax Propeller 2)
+''   Author..... Terry (KE4PJW) / ironsheep  --  built with Claude Code
+''   Target..... P2, spinc.exe  (see SPINC_BUILD.md)
+''
+''   STAGE 2 of the incremental build: DECODED FRAME MONITOR.
+''   The PASM2 forwarder cog still repeats every byte transparently between head
+''   and body (Stage 1), and now ALSO drops each received byte -- tagged with its
+''   origin -- into a hub ring buffer.  Cog0 drains that ring, assembles frames
+''   (tag .. 0x0D), and prints them decoded over the DEBUG terminal as:
+''
+''       HEAD: [0x83]
+''       HEAD: [0x8F]01
+''       BODY: N0144.390
+''       BODY: J1
+''
+''   Printable ASCII (0x20-0x7E) is shown as-is; other bytes as [0xNN].  Bare
+''   0xFF keepalives are suppressed by default; bare 0x0D power-on sync is shown.
+''
+''   Timing decoupling is the point: the forwarder never blocks on DEBUG.  It
+''   only writes a word to hub per byte (near free); the slow 2 Mbaud formatting
+''   and printing all happen in cog0, which can lag briefly during a burst and
+''   catch up in the next idle gap without ever disturbing the radio.
+''
+''   Next stage (needs the PC UART on P4/P5 wired, plus P6 LED / P7 PTT):
+''     Stage 3 - PC protocol: injection, MODE PASS/INJECT/HEADLESS/BODYLESS, QUIET
+''   See tmd700_p2_mitm_architecture.md for the full spec.
+''
+'' =================================================================================================
+''
+''   WIRING  (Terry's inline tap -- pairs grouped by data-flow direction):
+''
+''            P0  HEAD_OUT   TX -> control head RX   \_ BODY->HEAD repeater (P1 in, P0 out)
+''            P1  BODY_IN    RX <- RF deck  TX        /
+''            P2  BODY_OUT   TX -> RF deck  RX        \_ HEAD->BODY repeater (P3 in, P2 out)
+''            P3  HEAD_IN    RX <- control head TX    /
+''
+''   Radio link: 57600 baud, 8N1, idle-high, CMOS 3.3V.  Frame = tag + payload + $0D.
+''
+'' =================================================================================================
+
+
+con { clock }
+
+  '' 20 MHz crystal (P2 Eval / Edge) -> 200 MHz via PLL.  Confirmed correct for
+  '' this board in Stage 1 (DEBUG terminal is clean).
+  _clkfreq = 200_000_000
+
+
+con { radio link }
+
+  BAUD_RADIO   = 57_600
+
+  PIN_HEAD_OUT = 0                                              ' TX -> head   (BODY->HEAD data)
+  PIN_BODY_IN  = 1                                              ' RX <- body   (BODY->HEAD data)
+  PIN_BODY_OUT = 2                                              ' TX -> body   (HEAD->BODY data)
+  PIN_HEAD_IN  = 3                                              ' RX <- head   (HEAD->BODY data)
+
+
+con { monitor }
+
+  RING_N    = 1024                                             ' ring entries (must be power of 2)
+  RING_MASK = RING_N - 1
+  MAXFRAME  = 64                                               ' max bytes buffered per frame
+  LINE_MAX  = 512                                              ' formatted output line buffer
+
+  QUIET_IDLE = TRUE                                            ' suppress idle keepalives (bare 0xFF and bare 0x0D)
+  GAP_MS     = 500                                             ' idle gap that inserts a burst divider
+
+  DIR_HEAD  = 0                                                ' byte originated at control head
+  DIR_BODY  = 1                                                ' byte originated at RF deck
+
+
+var
+
+  '' shared with the forwarder cog via PTRA (must stay first / contiguous)
+  long  mbox[4]                                                ' [0]=bitmode [1]=wr_idx [2]=- [3]=@ring
+  word  ring[RING_N]                                           ' forwarder -> logger byte ring
+
+  '' logger (cog0) state
+  long  rd_idx                                                 ' consumer index
+  word  flen[2]                                                ' in-progress frame length per direction
+  byte  fbuf[2 * MAXFRAME]                                     ' per-direction frame assembly buffers
+  byte  linebuf[LINE_MAX]                                      ' formatted output line
+  long  n_frames                                               ' frames decoded
+  long  n_idle                                                 ' idle keepalive bytes suppressed
+  long  n_over                                                 ' ring-overflow bytes lost
+
+  '' millisecond clock + burst segmentation
+  long  ms_now                                                 ' ms since boot (monotonic)
+  long  ct_prev                                                ' last getct() sample
+  long  tick_frac                                              ' leftover ticks < 1 ms
+  long  ticks_ms                                               ' clock ticks per ms
+  long  last_emit_ms                                           ' ms of last printed frame
+
+
+pub main() | ent, dr, bt, wr, laststat_ms, now
+
+  '' async smart-pin bit timing (same recipe as jm_serial)
+  mbox[0] := muldiv64(clkfreq, $1_0000, BAUD_RADIO) & $FFFF_FC00
+  mbox[0] |= 7
+  mbox[1] := 0                                                 ' wr_idx
+  mbox[3] := @ring                                             ' hand the ring base to the forwarder
+
+  rd_idx  := 0
+  flen[0] := 0
+  flen[1] := 0
+
+  ticks_ms     := clkfreq / 1000
+  ms_now       := 0
+  tick_frac    := 0
+  ct_prev      := getct()
+  last_emit_ms := 0
+  laststat_ms  := 0
+
+  coginit(COGEXEC_NEW, @forwarder, @mbox)                      ' launch transparent forwarder
+
+  debug("TM-D700 MITM  Stage 2.5: protocol explorer  (57600 8N1)")
+  debug("  idle keepalives suppressed; [ms] timestamps; blank line = idle gap")
+
+  repeat
+    '' advance the millisecond clock (loop is tight, so getct() never laps 32-bit)
+    now := getct()
+    tick_frac += now - ct_prev
+    ct_prev := now
+    repeat while tick_frac >= ticks_ms
+      tick_frac -= ticks_ms
+      ms_now++
+
+    wr := mbox[1]                                             ' latest producer index
+    if rd_idx == wr
+      '' idle: periodic liveness so a quiet link doesn't look dead
+      if (ms_now - laststat_ms) >= 5000
+        laststat_ms := ms_now
+        debug("  -- alive: frames=", udec_(n_frames), "  idle=", udec_(n_idle), "  overflow=", udec_(n_over))
+    else
+      '' overflow guard: if the producer lapped us, skip ahead to the oldest kept byte
+      if (wr - rd_idx) > RING_N
+        n_over += (wr - rd_idx) - RING_N
+        rd_idx := wr - RING_N
+      ent := ring[rd_idx & RING_MASK]
+      rd_idx++
+      dr := (ent >> 8) & 1
+      bt := ent & $FF
+      accumulate(dr, bt)
+
+
+pri accumulate(dr, bt) | base, len
+
+  '' Feed one byte into the per-direction frame assembler and emit completed frames.
+
+  base := dr * MAXFRAME
+  len  := flen[dr]
+
+  if len == 0
+    '' buffer empty -> either a standalone idle byte or the tag of a new frame
+    if (bt == $FF) or (bt == $0D)                             ' idle keepalive (0xFF) / sync poll (0x0D)
+      n_idle++
+      if QUIET_IDLE == FALSE
+        emit1(dr, bt)
+      return
+    fbuf[base] := bt                                           ' start frame with tag byte
+    flen[dr] := 1
+    return
+
+  '' mid-frame
+  if bt == $0D                                                 ' terminator -> frame complete
+    emit_frame(dr, @fbuf[base], len)
+    flen[dr] := 0
+    n_frames++
+    return
+
+  fbuf[base + len] := bt
+  len++
+  flen[dr] := len
+  if len >= MAXFRAME                                           ' runaway guard: flush partial
+    emit_frame(dr, @fbuf[base], len)
+    flen[dr] := 0
+    n_frames++
+
+
+pri emit1(dr, bt) | tb
+
+  '' Emit a single standalone byte as its own line.
+
+  tb := bt
+  emit_frame(dr, @tb, 1)
+
+
+pri emit_frame(dr, pbuf, len) | i, c, p, gap
+
+  '' Format "[ms] HEAD/BODY: ..." into linebuf and print it in one DEBUG call.
+  '' A gap of GAP_MS since the last frame inserts a blank line to segment bursts.
+
+  gap := ms_now - last_emit_ms
+  if (last_emit_ms <> 0) and (gap >= GAP_MS)
+    debug(" ")
+  last_emit_ms := ms_now
+
+  p := @linebuf
+  byte[p++] := "["
+  p := putdec(p, ms_now, 8)                                    ' right-justified ms timestamp
+  byte[p++] := "]"
+  byte[p++] := " "
+
+  if dr == DIR_BODY
+    byte[p++] := "B"
+    byte[p++] := "O"
+    byte[p++] := "D"
+    byte[p++] := "Y"
+  else
+    byte[p++] := "H"
+    byte[p++] := "E"
+    byte[p++] := "A"
+    byte[p++] := "D"
+  byte[p++] := ":"
+  byte[p++] := " "
+
+  repeat i from 0 to len - 1
+    c := byte[pbuf][i]
+    if (c >= $20) and (c <= $7E)
+      byte[p++] := c
+    else
+      byte[p++] := "["
+      byte[p++] := "0"
+      byte[p++] := "x"
+      byte[p++] := hexd(c >> 4)
+      byte[p++] := hexd(c & $F)
+      byte[p++] := "]"
+
+  byte[p] := 0
+  debug(zstr_(@linebuf))
+
+
+pri hexd(n) : ch
+
+  if n < 10
+    ch := "0" + n
+  else
+    ch := "A" + (n - 10)
+
+
+pri putdec(p, val, width) : np | n, i, dig[12]
+
+  '' Write val as right-justified, space-padded decimal of 'width' into buf at p.
+
+  n := 0
+  if val == 0
+    dig[n++] := 0
+  else
+    repeat while val > 0
+      dig[n++] := val // 10
+      val /= 10
+
+  repeat (width - n)                                          ' left-pad with spaces
+    byte[p++] := " "
+  repeat i from n - 1 to 0                                    ' emit most-significant first
+    byte[p++] := "0" + dig[i]
+  return p
+
+
+dat { transparent forwarder + ring producer (PASM2) }
+
+              org       0
+
+'' On entry: PTRA = @mbox.  mbox[0]=bitmode, mbox[1]=wr_idx (published here),
+'' mbox[3]=@ring.  Forwards each received byte immediately (send-first, so the
+'' async-TX smart pin never deadlocks -- see Stage 1) and pushes a tagged copy
+'' into the ring for cog0 to decode.
+
+forwarder     mov       adr_wr, ptra
+              add       adr_wr, #4                              ' &mbox[1] (wr_idx)
+              mov       t0, ptra
+              add       t0, #12                                 ' &mbox[3] (@ring)
+              rdlong    ringbase, t0
+              rdlong    bitmode, ptra                           ' mbox[0]
+              mov       maskv, ##RING_MASK
+              mov       wrx, #0
+              wrlong    wrx, adr_wr
+
+              ' ---- receive smart pins (P1 body-in, P3 head-in) ----
+              fltl      #PIN_BODY_IN
+              wrpin     ##P_ASYNC_RX, #PIN_BODY_IN
+              wxpin     bitmode, #PIN_BODY_IN
+              drvl      #PIN_BODY_IN
+
+              fltl      #PIN_HEAD_IN
+              wrpin     ##P_ASYNC_RX, #PIN_HEAD_IN
+              wxpin     bitmode, #PIN_HEAD_IN
+              drvl      #PIN_HEAD_IN
+
+              ' ---- transmit smart pins (P0 head-out, P2 body-out) ----
+              ' Slew-limit the TX drivers (1.5k instead of the default 30mA fast
+              ' driver) so their edges couple far less into the adjacent RX pin
+              ' (P0<->P1, P2<->P3).  Still ~30ns edges << 17.4us bit time.
+              fltl      #PIN_HEAD_OUT
+              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_HEAD_OUT
+              wxpin     bitmode, #PIN_HEAD_OUT
+              drvl      #PIN_HEAD_OUT
+
+              fltl      #PIN_BODY_OUT
+              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_BODY_OUT
+              wxpin     bitmode, #PIN_BODY_OUT
+              drvl      #PIN_BODY_OUT
+
+fwd_loop
+              ' ---- BODY -> HEAD ----
+              testp     #PIN_BODY_IN            wc              ' C = byte available?
+        if_nc jmp       #.chk_head
+              rdpin     rxb, #PIN_BODY_IN                       ' read + acknowledge
+              shr       rxb, #24                                ' byte lands in bits[31:24]
+              wypin     rxb, #PIN_HEAD_OUT                      ' forward now (buffered)
+              mov       entx, rxb
+              or        entx, #$100                              ' tag: BODY origin
+              call      #rput
+
+.chk_head
+              ' ---- HEAD -> BODY ----
+              testp     #PIN_HEAD_IN            wc
+        if_nc jmp       #fwd_loop
+              rdpin     rxb, #PIN_HEAD_IN
+              shr       rxb, #24
+              wypin     rxb, #PIN_BODY_OUT                      ' forward now (buffered)
+              mov       entx, rxb                                ' tag: HEAD origin (bit8 = 0)
+              call      #rput
+
+              jmp       #fwd_loop
+
+'' rput -- append 'entx' (word: bit8=dir, bits7:0=byte) to the ring, publish wrx
+rput          mov       hubp, wrx
+              and       hubp, maskv
+              shl       hubp, #1                                ' word index -> byte offset
+              add       hubp, ringbase
+              wrword    entx, hubp
+              add       wrx, #1
+              wrlong    wrx, adr_wr
+rput_ret      ret
+
+' ---- cog registers ----
+bitmode       res       1
+adr_wr        res       1                                      ' hub &mbox[1]
+ringbase      res       1                                      ' hub @ring
+maskv         res       1                                      ' RING_MASK
+wrx           res       1                                      ' producer index
+entx          res       1                                      ' ring entry being pushed
+hubp          res       1                                      ' scratch hub address
+rxb           res       1                                      ' received byte
+t0            res       1                                      ' scratch
+
+              fit
