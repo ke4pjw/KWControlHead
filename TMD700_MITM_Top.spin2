@@ -2,7 +2,7 @@
 ''
 ''   File....... TMD700_MITM_Top.spin2
 ''   Purpose.... Kenwood TM-D700 head<->body UART MITM bridge  (Parallax Propeller 2)
-''   Author..... Terry (KE4PJW) / ironsheep  --  built with Claude Code
+''   Author..... Terry (KE4PJW) / ke4pjw  --  built with Claude Code
 ''   Target..... P2, spinc.exe  (see SPINC_BUILD.md)
 ''
 ''   STAGE 2 of the incremental build: DECODED FRAME MONITOR.

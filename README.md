@@ -5,7 +5,7 @@ control head and its RF deck, and building a [Parallax Propeller 2](https://www.
 based software replacement control head — with the longer-term goal of a generic
 Kenwood aftermarket head platform.
 
-**Author:** Terry Trapp (KE4PJW) · GitHub [@ironsheep](https://github.com/ironsheep)
+**Author:** Terry Trapp (KE4PJW) · GitHub [@ke4pjw](https://github.com/ke4pjw)
 
 > ⚠️ This is active research on one irreplaceable control head. All hardware work
 > is non-destructive; the P2 taps the head↔deck cable inline and is transparent

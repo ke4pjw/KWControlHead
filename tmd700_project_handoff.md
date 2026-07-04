@@ -12,7 +12,7 @@ Reverse-engineering the proprietary UART protocol between the Kenwood TM-D700 co
 
 **Hardware:** Parallax Propeller 2 (P2) — Terry's primary maker platform.  
 **Terry's callsign:** KE4PJW. Lebanon, Tennessee (UTC−5).  
-**GitHub handle:** ironsheep.
+**GitHub handle:** ke4pjw.
 
 ---
 
