@@ -72,6 +72,16 @@ con { monitor }
   DIR_HEAD  = 0                                                ' byte originated at control head
   DIR_BODY  = 1                                                ' byte originated at RF deck
 
+  '' Ring-buffer entry, filled by the forwarder cog at RECEIVE time.  Packed
+  '' (no padding) so the PASM producer and Spin consumer agree on the layout:
+  ''   offset 0: dir    1: token    2-3: attr    4-7: ms
+  STRUCT rxentry(BYTE dir, BYTE token, WORD attr, LONG ms)
+  ENTRY_BYTES = 8                                              ' = sizeof(rxentry); PASM producer stride
+
+  '' attribute flags (set by the forwarder from the raw byte value)
+  ATTR_KEEPALIVE = %01                                         ' token is a bare 0xFF idle keepalive
+  ATTR_CR        = %10                                         ' token is 0x0D (frame terminator / power-on sync)
+
 
 obj
 
@@ -81,12 +91,13 @@ obj
 var
 
   '' shared with the forwarder cog via PTRA (must stay first / contiguous)
-  long  mbox[4]                                                ' [0]=bitmode [1]=wr_idx [2]=- [3]=@ring
-  word  ring[RING_N]                                           ' forwarder -> logger byte ring
+  long  mbox[4]                                                ' [0]=bitmode [1]=wr_idx [2]=@ring [3]=ms_pub
+  rxentry ring[RING_N]                                         ' forwarder -> logger, defined-layout entries
 
   '' logger (cog0) state
   long  rd_idx                                                 ' consumer index
   word  flen[2]                                                ' in-progress frame length per direction
+  long  fstart[2]                                              ' receive-ms of the frame's first byte, per direction
   byte  fbuf[2 * MAXFRAME]                                     ' per-direction frame assembly buffers
   byte  linebuf[LINE_MAX]                                      ' formatted output line
   long  n_frames                                               ' frames decoded
@@ -101,13 +112,14 @@ var
   long  last_emit_ms                                           ' ms of last printed frame
 
 
-pub main() | ent, dr, bt, wr, laststat_ms, now
+pub main() | wr, laststat_ms, now, rxentry ent
 
   '' async smart-pin bit timing (same recipe as jm_serial)
   mbox[0] := muldiv64(clkfreq, $1_0000, BAUD_RADIO) & $FFFF_FC00
   mbox[0] |= 7
-  mbox[1] := 0                                                 ' wr_idx
-  mbox[3] := @ring                                             ' hand the ring base to the forwarder
+  mbox[1] := 0                                                 ' wr_idx (entries)
+  mbox[2] := @ring                                            ' hand the ring base to the forwarder
+  mbox[3] := 0                                                ' ms_pub (we publish current ms here)
 
   rd_idx  := 0
   flen[0] := 0
@@ -133,82 +145,84 @@ pub main() | ent, dr, bt, wr, laststat_ms, now
     repeat while tick_frac >= ticks_ms
       tick_frac -= ticks_ms
       ms_now++
+    mbox[3] := ms_now                                         ' publish ms for the forwarder to stamp entries
 
-    wr := mbox[1]                                             ' latest producer index
+    wr := mbox[1]                                             ' latest producer index (entries)
     if rd_idx == wr
       '' idle: periodic liveness so a quiet link doesn't look dead
       if (ms_now - laststat_ms) >= 5000
         laststat_ms := ms_now
         debug("  -- alive: frames=", udec_(n_frames), "  idle=", udec_(n_idle), "  overflow=", udec_(n_over))
     else
-      '' overflow guard: if the producer lapped us, skip ahead to the oldest kept byte
+      '' overflow guard: if the producer lapped us, skip ahead to the oldest kept entry
       if (wr - rd_idx) > RING_N
         n_over += (wr - rd_idx) - RING_N
         rd_idx := wr - RING_N
-      ent := ring[rd_idx & RING_MASK]
+      ent := ring[rd_idx & RING_MASK]                         ' struct copy (dir/token/attr/ms)
       rd_idx++
-      dr := (ent >> 8) & 1
-      bt := ent & $FF
-      accumulate(dr, bt)
+      accumulate(ent)
 
 
-pri accumulate(dr, bt) | base, len
+pri accumulate(rxentry e) | base, len
 
-  '' Feed one byte into the per-direction frame assembler and emit completed frames.
+  '' Feed one received entry into the per-direction frame assembler and emit
+  '' completed frames.  The entry carries its own receive-ms and attribute flags.
 
-  base := dr * MAXFRAME
-  len  := flen[dr]
+  base := e.dir * MAXFRAME
+  len  := flen[e.dir]
 
   if len == 0
     '' buffer empty -> either a standalone idle byte or the tag of a new frame
-    if (bt == $FF) or (bt == $0D)                             ' idle keepalive (0xFF) / sync poll (0x0D)
+    if (e.attr & (ATTR_KEEPALIVE | ATTR_CR))                  ' idle keepalive (0xFF) / bare sync (0x0D)
       n_idle++
       if QUIET_IDLE == FALSE
-        emit1(dr, bt)
+        emit1(e.dir, e.token, e.ms)
       return
-    fbuf[base] := bt                                           ' start frame with tag byte
-    flen[dr] := 1
+    fbuf[base] := e.token                                     ' start frame with tag byte
+    flen[e.dir]   := 1
+    fstart[e.dir] := e.ms                                     ' remember when the frame started
     return
 
   '' mid-frame
-  if bt == $0D                                                 ' terminator -> frame complete
-    emit_frame(dr, @fbuf[base], len)
-    flen[dr] := 0
+  if e.token == $0D                                           ' terminator -> frame complete
+    emit_frame(e.dir, @fbuf[base], len, fstart[e.dir])
+    flen[e.dir] := 0
     n_frames++
     return
 
-  fbuf[base + len] := bt
+  fbuf[base + len] := e.token
   len++
-  flen[dr] := len
-  if len >= MAXFRAME                                           ' runaway guard: flush partial
-    emit_frame(dr, @fbuf[base], len)
-    flen[dr] := 0
+  flen[e.dir] := len
+  if len >= MAXFRAME                                          ' runaway guard: flush partial
+    emit_frame(e.dir, @fbuf[base], len, fstart[e.dir])
+    flen[e.dir] := 0
     n_frames++
 
 
-pri emit1(dr, bt) | tb
+pri emit1(dr, bt, ts) | tb
 
-  '' Emit a single standalone byte as its own line.
+  '' Emit a single standalone byte as its own line, stamped with its receive-ms.
 
   tb := bt
-  emit_frame(dr, @tb, 1)
+  emit_frame(dr, @tb, 1, ts)
 
 
-pri emit_frame(dr, pbuf, len) | i, c, gap, BYTE tmp[16]
+pri emit_frame(dr, pbuf, len, ts) | i, c, gap, BYTE tmp[16]
 
   '' Format "[ms] HEAD/BODY: ..." into linebuf and print it in one DEBUG call.
+  '' 'ts' is the receive-ms of the frame's first byte (from the ring entry).
   '' A gap of GAP_MS since the last frame inserts a blank line to segment bursts.
   '' Uses jm_strings for the string building and number formatting.
 
-  gap := ms_now - last_emit_ms
+  gap := ts - last_emit_ms
   if (last_emit_ms <> 0) and (gap >= GAP_MS)
     debug(" ")
-  last_emit_ms := ms_now
+  last_emit_ms := ts
 
   byte[@linebuf] := 0                                          ' start with an empty z-string
 
   strs.append_char(@linebuf, "[")
-  strs.rjdec(ms_now, 8, " ", @tmp)                             ' right-justified ms timestamp
+  strs.rjdec(ts, 8, " ", @tmp)                                ' right-justified receive-ms timestamp
   strs.append_str(@linebuf, @tmp)
   strs.append_str(@linebuf, string("] "))
 
@@ -235,15 +249,18 @@ dat { transparent forwarder + ring producer (PASM2) }
               org       0
 
 '' On entry: PTRA = @mbox.  mbox[0]=bitmode, mbox[1]=wr_idx (published here),
-'' mbox[3]=@ring.  Forwards each received byte immediately (send-first, so the
-'' async-TX smart pin never deadlocks -- see Stage 1) and pushes a tagged copy
-'' into the ring for cog0 to decode.
+'' mbox[2]=@ring, mbox[3]=ms_pub (current ms, published by cog0).  Forwards each
+'' received byte immediately (send-first, so the async-TX smart pin never
+'' deadlocks -- see Stage 1) and writes a defined rxentry {dir,token,attr,ms}
+'' into the ring, timestamped at receive time, for cog0 to decode.
 
 forwarder     mov       adr_wr, ptra
               add       adr_wr, #4                              ' &mbox[1] (wr_idx)
               mov       t0, ptra
-              add       t0, #12                                 ' &mbox[3] (@ring)
+              add       t0, #8                                  ' &mbox[2] (@ring)
               rdlong    ringbase, t0
+              mov       adr_ms, ptra
+              add       adr_ms, #12                             ' &mbox[3] (ms_pub)
               rdlong    bitmode, ptra                           ' mbox[0]
               mov       maskv, ##RING_MASK
               mov       wrx, #0
@@ -281,8 +298,7 @@ fwd_loop
               rdpin     rxb, #PIN_BODY_IN                       ' read + acknowledge
               shr       rxb, #24                                ' byte lands in bits[31:24]
               wypin     rxb, #PIN_HEAD_OUT                      ' forward now (buffered)
-              mov       entx, rxb
-              or        entx, #$100                              ' tag: BODY origin
+              mov       dirval, #DIR_BODY
               call      #rput
 
 .chk_head
@@ -292,17 +308,37 @@ fwd_loop
               rdpin     rxb, #PIN_HEAD_IN
               shr       rxb, #24
               wypin     rxb, #PIN_BODY_OUT                      ' forward now (buffered)
-              mov       entx, rxb                                ' tag: HEAD origin (bit8 = 0)
+              mov       dirval, #DIR_HEAD
               call      #rput
 
               jmp       #fwd_loop
 
-'' rput -- append 'entx' (word: bit8=dir, bits7:0=byte) to the ring, publish wrx
+'' rput -- write a defined rxentry to the ring and publish the write index.
+''   long0 = dir | token<<8 | attr<<16   (bytes: 0=dir 1=token 2..3=attr)
+''   long1 = ms  (receive timestamp, bytes 4..7)
+'' rxb holds the byte, dirval holds the direction.
 rput          mov       hubp, wrx
               and       hubp, maskv
-              shl       hubp, #1                                ' word index -> byte offset
+              shl       hubp, #3                                ' entry index -> byte offset (x ENTRY_BYTES=8)
               add       hubp, ringbase
-              wrword    entx, hubp
+
+              mov       attrv, #0                               ' derive attribute flags from the raw byte
+              cmp       rxb, #$FF               wz
+        if_z  or        attrv, #ATTR_KEEPALIVE
+              cmp       rxb, #$0D               wz
+        if_z  or        attrv, #ATTR_CR
+
+              mov       ent0, rxb                               ' token -> [15:8]
+              shl       ent0, #8
+              or        ent0, dirval                           ' dir -> [7:0]
+              shl       attrv, #16                             ' attr -> [31:16]
+              or        ent0, attrv
+              wrlong    ent0, hubp                             ' dir/token/attr
+
+              rdlong    msv, adr_ms                            ' current ms (published by cog0)
+              add       hubp, #4
+              wrlong    msv, hubp                              ' receive timestamp
+
               add       wrx, #1
               wrlong    wrx, adr_wr
 rput_ret      ret
@@ -311,9 +347,13 @@ rput_ret      ret
 bitmode       res       1
 adr_wr        res       1                                      ' hub &mbox[1]
 ringbase      res       1                                      ' hub @ring
+adr_ms        res       1                                      ' hub &mbox[3] (ms_pub)
 maskv         res       1                                      ' RING_MASK
-wrx           res       1                                      ' producer index
-entx          res       1                                      ' ring entry being pushed
+wrx           res       1                                      ' producer index (entries)
+dirval        res       1                                      ' direction of current byte
+attrv         res       1                                      ' attribute flags scratch
+ent0          res       1                                      ' packed dir/token/attr long
+msv           res       1                                      ' receive-ms scratch
 hubp          res       1                                      ' scratch hub address
 rxb           res       1                                      ' received byte
 t0            res       1                                      ' scratch
