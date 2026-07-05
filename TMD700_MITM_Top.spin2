@@ -73,6 +73,11 @@ con { monitor }
   DIR_BODY  = 1                                                ' byte originated at RF deck
 
 
+obj
+
+  strs : "jm_strings"                                          ' string build + number formatting
+
+
 var
 
   '' shared with the forwarder cog via PTRA (must stay first / contiguous)
@@ -189,76 +194,40 @@ pri emit1(dr, bt) | tb
   emit_frame(dr, @tb, 1)
 
 
-pri emit_frame(dr, pbuf, len) | i, c, p, gap
+pri emit_frame(dr, pbuf, len) | i, c, gap, BYTE tmp[16]
 
   '' Format "[ms] HEAD/BODY: ..." into linebuf and print it in one DEBUG call.
   '' A gap of GAP_MS since the last frame inserts a blank line to segment bursts.
+  '' Uses jm_strings for the string building and number formatting.
 
   gap := ms_now - last_emit_ms
   if (last_emit_ms <> 0) and (gap >= GAP_MS)
     debug(" ")
   last_emit_ms := ms_now
 
-  p := @linebuf
-  byte[p++] := "["
-  p := putdec(p, ms_now, 8)                                    ' right-justified ms timestamp
-  byte[p++] := "]"
-  byte[p++] := " "
+  byte[@linebuf] := 0                                          ' start with an empty z-string
+
+  strs.append_char(@linebuf, "[")
+  strs.rjdec(ms_now, 8, " ", @tmp)                             ' right-justified ms timestamp
+  strs.append_str(@linebuf, @tmp)
+  strs.append_str(@linebuf, string("] "))
 
   if dr == DIR_BODY
-    byte[p++] := "B"
-    byte[p++] := "O"
-    byte[p++] := "D"
-    byte[p++] := "Y"
+    strs.append_str(@linebuf, string("BODY: "))
   else
-    byte[p++] := "H"
-    byte[p++] := "E"
-    byte[p++] := "A"
-    byte[p++] := "D"
-  byte[p++] := ":"
-  byte[p++] := " "
+    strs.append_str(@linebuf, string("HEAD: "))
 
   repeat i from 0 to len - 1
     c := byte[pbuf][i]
-    if (c >= $20) and (c <= $7E)
-      byte[p++] := c
-    else
-      byte[p++] := "["
-      byte[p++] := "0"
-      byte[p++] := "x"
-      byte[p++] := hexd(c >> 4)
-      byte[p++] := hexd(c & $F)
-      byte[p++] := "]"
+    if (c >= $20) and (c <= $7E)                              ' printable -> literal
+      strs.append_char(@linebuf, c)
+    else                                                      ' otherwise -> [0xNN]
+      strs.append_str(@linebuf, string("[0x"))
+      strs.fxhex(c, 2, @tmp)
+      strs.append_str(@linebuf, @tmp)
+      strs.append_char(@linebuf, "]")
 
-  byte[p] := 0
   debug(zstr_(@linebuf))
-
-
-pri hexd(n) : ch
-
-  if n < 10
-    ch := "0" + n
-  else
-    ch := "A" + (n - 10)
-
-
-pri putdec(p, val, width) : np | n, i, dig[12]
-
-  '' Write val as right-justified, space-padded decimal of 'width' into buf at p.
-
-  n := 0
-  if val == 0
-    dig[n++] := 0
-  else
-    repeat while val > 0
-      dig[n++] := val // 10
-      val /= 10
-
-  repeat (width - n)                                          ' left-pad with spaces
-    byte[p++] := " "
-  repeat i from n - 1 to 0                                    ' emit most-significant first
-    byte[p++] := "0" + dig[i]
-  return p
 
 
 dat { transparent forwarder + ring producer (PASM2) }

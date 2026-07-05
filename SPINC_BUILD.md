@@ -27,6 +27,12 @@ Drop these files into your Spin2 project directory and update the variables belo
 | `-d` | Enable debug mode |
 | `-t` | Send debug output to stdout (terminal) |
 | `-r` | Load to RAM and run (not flash) |
+| `-L <path>` | Add a library directory to the object search path |
+
+**Library path (`-L`) is required.** `spinc` does not auto-search its own
+`library/spin2` folder, and `TMD700_MITM_Top.spin2` uses the JonnyMac library
+objects (`jm_strings`, `jm_nstr`). Always pass
+`-L "C:\spin-tools\library\spin2"` or the build fails with `object ... not found`.
 
 ## COM Port Auto-Detection
 
@@ -46,7 +52,7 @@ The included `detect_p2.sh` script finds the P2 by scanning for its FTDI USB chi
 source ./detect_p2.sh
 
 # Use the detected port
-"<SPINC>" -p $P2_PORT -d -t -r "<TOP_FILE>"
+"<SPINC>" -p $P2_PORT -d -t -r -L "C:\spin-tools\library\spin2" "<TOP_FILE>"
 ```
 
 Or run standalone to print the detected port:
@@ -74,14 +80,14 @@ ERROR: No Propeller 2 detected on any COM port.
 
 ```bash
 source ./detect_p2.sh
-"<SPINC>" -p $P2_PORT -d -t -r "<PROJECT_DIR>/<TOP_FILE>"
+"<SPINC>" -p $P2_PORT -d -t -r -L "C:\spin-tools\library\spin2" "<PROJECT_DIR>/<TOP_FILE>"
 ```
 
 ### Example
 
 ```bash
 source ./detect_p2.sh
-"<SPINC>" -p $P2_PORT -d -t -r "./DebugTest_Top.spin2"
+"C:/spin-tools/spinc.exe" -p $P2_PORT -d -t -r -L "C:/spin-tools/library/spin2" "./TMD700_MITM_Top.spin2"
 ```
 
 ## Exiting Terminal Mode
