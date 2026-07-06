@@ -1,6 +1,10 @@
 # Parallax's copyrighted Spin2 documentation — reference only, not ours to redistribute
 Parallax Spin2 Documentation v54.docx
 
+# Kenwood's copyrighted TM-D700 manual — local reference only, not ours to redistribute
+TM-D700_instruction_manual.pdf
+*.pdf
+
 # Local Claude Code settings (machine-specific absolute paths)
 .claude/
 
