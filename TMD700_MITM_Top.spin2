@@ -1,169 +1,70 @@
 '' =================================================================================================
 ''
 ''   File....... TMD700_MITM_Top.spin2
-''   Purpose.... Kenwood TM-D700 head<->body UART MITM bridge  (Parallax Propeller 2)
-''   Author..... Terry (KE4PJW) / ke4pjw  --  built with Claude Code
-''   Target..... P2, spinc.exe  (see SPINC_BUILD.md -- build needs -L <spin-tools>/library/spin2)
+''   Purpose.... Troubleshooting monitor for the TM-D700 head<->body link.  A thin harness
+''              over the standalone "tmd700_mitm" object: pulls decoded frames from it and
+''              prints them over the DEBUG terminal.  Keep this build for troubleshooting the
+''              protocol / the tap while the replacement-head firmware is developed separately.
+''   Author.... Terry (KE4PJW) / ke4pjw  --  built with Claude Code
+''   Target.... P2, spinc.exe   (build needs -L <spin-tools>/library/spin2  for jm_strings)
 ''
-''   STAGE 2.5: PROTOCOL EXPLORER, frame-struct ring.
-''   A dedicated PASM2 cog forwards every byte transparently between head and
-''   body (byte-exact, non-blocking passthrough), and IN PARALLEL assembles the
-''   byte stream into complete frames.  Each finished frame is written into the
-''   ring as a defined struct:
-''
-''       STRUCT rxframe(BYTE dir, BYTE len, WORD attr, LONG ms, BYTE payload[MAXPAY])
-''
-''   so cog0 reads whole frames by field (dir/len/attr/ms/payload) with no
-''   bit-unpacking and no reassembly, and prints them decoded over the DEBUG
-''   terminal:
-''
+''   Output:
 ''       [   59244] BODY: N0144.390
 ''       [   60342] HEAD: [0x8F]01
-''
-''   ms is captured at RECEIVE time (frame's first byte).  Bare 0xFF keepalives
-''   and bare 0x0D sync polls are flagged (ATTR_KEEPALIVE/ATTR_CR) and suppressed
-''   by default.  Printable ASCII (0x20-0x7E) shows as-is; other bytes as [0xNN].
-''
-''   Timing decoupling: the forwarder writes to hub (near free) and never blocks
-''   on DEBUG; the slow 2 Mbaud formatting all happens in cog0, off the ring.
-''
-'' =================================================================================================
-''
-''   WIRING  (Terry's inline tap -- pairs grouped by data-flow direction):
-''
-''            P0  HEAD_OUT   TX -> control head RX   \_ BODY->HEAD repeater (P1 in, P0 out)
-''            P1  BODY_IN    RX <- RF deck  TX        /
-''            P2  BODY_OUT   TX -> RF deck  RX        \_ HEAD->BODY repeater (P3 in, P2 out)
-''            P3  HEAD_IN    RX <- control head TX    /
-''
-''   Radio link: 57600 baud, 8N1, idle-high, CMOS 3.3V.  Frame = tag + payload + $0D.
+''   Printable ASCII (0x20-0x7E) shown as-is, other bytes as [0xNN].  Idle keepalive/sync
+''   frames suppressed by default; a >=GAP_MS gap inserts a blank line to segment bursts.
 ''
 '' =================================================================================================
 
 
-con { clock }
+con
 
-  '' 20 MHz crystal (P2 Eval / Edge) -> 200 MHz via PLL.  Confirmed correct for this board.
   _clkfreq = 200_000_000
 
-
-con { radio link }
-
-  BAUD_RADIO   = 57_600
-
-  PIN_HEAD_OUT = 0                                              ' TX -> head   (BODY->HEAD data)
-  PIN_BODY_IN  = 1                                              ' RX <- body   (BODY->HEAD data)
-  PIN_BODY_OUT = 2                                              ' TX -> body   (HEAD->BODY data)
-  PIN_HEAD_IN  = 3                                              ' RX <- head   (HEAD->BODY data)
-
-
-con { monitor }
-
-  RING_N    = 128                                             ' frame ring depth (power of 2)
-  RING_MASK = RING_N - 1
-  MAXPAY    = 64                                              ' max payload bytes/frame (power of 2, mult of 4)
-  LINE_MAX  = 512                                             ' formatted output line buffer
-
-  QUIET_IDLE = TRUE                                           ' suppress idle keepalive/sync frames
-  GAP_MS     = 500                                            ' idle gap that inserts a burst divider
-
-  DIR_HEAD  = 0                                               ' frame originated at control head
-  DIR_BODY  = 1                                               ' frame originated at RF deck
-
-  '' Ring entry = one complete frame.  Packed (no padding), declaration order:
-  ''   offset 0: dir   1: len   2-3: attr   4-7: ms   8..8+MAXPAY-1: payload
-  STRUCT rxframe(BYTE dir, BYTE len, WORD attr, LONG ms, BYTE payload[MAXPAY])
-  FRAME_BYTES = 8 + MAXPAY                                    ' = sizeof(rxframe) = 72; PASM stride
-
-  '' attribute flags (set by the forwarder as it assembles the frame)
-  ATTR_KEEPALIVE = %001                                       ' 1-byte frame: bare 0xFF idle keepalive
-  ATTR_CR        = %010                                       ' 1-byte frame: bare 0x0D sync/power-on poll
-  ATTR_TRUNC     = %100                                       ' frame hit MAXPAY with no terminator
+  QUIET_IDLE = TRUE                                            ' suppress idle keepalive/sync frames
+  GAP_MS     = 500                                            ' idle gap (ms) that inserts a burst divider
+  LINE_MAX   = 512
 
 
 obj
 
-  strs : "jm_strings"                                         ' string build + number formatting
+  mitm : "tmd700_mitm"                                         ' the MITM bridge (UARTs, forwarder, frame ring)
+  strs : "jm_strings"                                          ' string build + number formatting
 
 
 var
 
-  '' shared with the forwarder cog via PTRA (must stay first / contiguous)
-  long  mbox[8]                                               ' [0]bitmode [1]wr_idx [2]@ring [3]ms_pub [4]@stage
-  rxframe ring[RING_N]                                        ' the ring buffer: array of frame structs
-  byte  stage[2 * MAXPAY]                                     ' forwarder per-direction payload assembly
-
-  '' logger (cog0) state
-  long  rd_idx                                                ' consumer index (frames)
-  byte  linebuf[LINE_MAX]                                     ' formatted output line
-  long  n_frames                                              ' frames printed
-  long  n_idle                                                ' idle frames suppressed
-  long  n_over                                                ' ring-overflow frames lost
-
-  '' millisecond clock + burst segmentation
-  long  ms_now                                                ' ms since boot (monotonic)
-  long  ct_prev                                               ' last getct() sample
-  long  tick_frac                                             ' leftover ticks < 1 ms
-  long  ticks_ms                                              ' clock ticks per ms
-  long  last_emit_ms                                          ' receive-ms of last printed frame
+  byte  linebuf[LINE_MAX]
+  long  last_emit_ms
+  long  n_frames
+  long  n_idle
+  long  ct_alive
 
 
-pub main() | wr, laststat_ms, now
+pub main() | p
 
-  '' async smart-pin bit timing (same recipe as jm_serial)
-  mbox[0] := muldiv64(clkfreq, $1_0000, BAUD_RADIO) & $FFFF_FC00
-  mbox[0] |= 7
-  mbox[1] := 0                                                ' wr_idx (frames)
-  mbox[2] := @ring                                            ' ring base
-  mbox[3] := 0                                                ' ms_pub (we publish current ms here)
-  mbox[4] := @stage                                           ' per-direction assembly buffers
+  mitm.start(mitm.MODE_PASS)                                   ' transparent inline: forward + decode
 
-  rd_idx := 0
+  debug("TM-D700 MITM monitor (object build)  (57600 8N1)")
+  debug("  idle keepalives suppressed; [ms] receive timestamps; blank line = idle gap")
 
-  ticks_ms     := clkfreq / 1000
-  ms_now       := 0
-  tick_frac    := 0
-  ct_prev      := getct()
   last_emit_ms := 0
-  laststat_ms  := 0
-
-  coginit(COGEXEC_NEW, @forwarder, @mbox)                     ' launch transparent forwarder + framer
-
-  debug("TM-D700 MITM  Stage 2.5: protocol explorer  (57600 8N1)")
-  debug("  frame-struct ring; idle keepalives suppressed; [ms] receive timestamps")
+  ct_alive := getct()
 
   repeat
-    '' advance the millisecond clock (loop is tight, so getct() never laps 32-bit)
-    now := getct()
-    tick_frac += now - ct_prev
-    ct_prev := now
-    repeat while tick_frac >= ticks_ms
-      tick_frac -= ticks_ms
-      ms_now++
-    mbox[3] := ms_now                                         ' publish ms for the forwarder to stamp frames
-
-    wr := mbox[1]                                             ' latest producer index (frames)
-    if rd_idx == wr
-      '' idle: periodic liveness so a quiet link doesn't look dead
-      if (ms_now - laststat_ms) >= 5000
-        laststat_ms := ms_now
-        debug("  -- alive: frames=", udec_(n_frames), "  idle=", udec_(n_idle), "  overflow=", udec_(n_over))
-    else
-      '' overflow guard: if the producer lapped us, skip ahead to the oldest kept frame
-      if (wr - rd_idx) > RING_N
-        n_over += (wr - rd_idx) - RING_N
-        rd_idx := wr - RING_N
-      show_frame(@ring[rd_idx & RING_MASK])                   ' pass a pointer to the whole frame
-      rd_idx++
+    p := mitm.next_frame()
+    if p
+      show_frame(p)
+    elseif (getct() - ct_alive) >= (clkfreq * 5)              ' periodic liveness when quiet
+      ct_alive := getct()
+      debug("  -- alive: frames=", udec_(n_frames), "  idle=", udec_(n_idle), "  overflow=", udec_(mitm.overflows()))
 
 
-pri show_frame(^rxframe pf) | i, c, gap, BYTE tmp[16]
+pri show_frame(^mitm.rxframe pf) | i, c, gap, BYTE tmp[16]
 
   '' Print one complete frame as "[ms] HEAD/BODY: ..." in a single DEBUG call.
-  '' Idle keepalive/sync frames are dropped when QUIET_IDLE.  A gap of GAP_MS
-  '' since the last frame inserts a blank line to segment bursts.
 
-  if QUIET_IDLE and (pf.attr & (ATTR_KEEPALIVE | ATTR_CR))
+  if QUIET_IDLE and (pf.attr & (mitm.ATTR_KEEPALIVE | mitm.ATTR_CR))
     n_idle++
     return
 
@@ -174,250 +75,26 @@ pri show_frame(^rxframe pf) | i, c, gap, BYTE tmp[16]
     debug(" ")
   last_emit_ms := pf.ms
 
-  byte[@linebuf] := 0                                          ' start with an empty z-string
+  byte[@linebuf] := 0
 
   strs.append_char(@linebuf, "[")
-  strs.rjdec(pf.ms, 8, " ", @tmp)                             ' right-justified receive-ms
+  strs.rjdec(pf.ms, 8, " ", @tmp)
   strs.append_str(@linebuf, @tmp)
   strs.append_str(@linebuf, string("] "))
 
-  if pf.dir == DIR_BODY
+  if pf.dir == mitm.DIR_BODY
     strs.append_str(@linebuf, string("BODY: "))
   else
     strs.append_str(@linebuf, string("HEAD: "))
 
   repeat i from 0 to pf.len - 1
     c := pf.payload[i]
-    if (c >= $20) and (c <= $7E)                              ' printable -> literal
+    if (c >= $20) and (c <= $7E)
       strs.append_char(@linebuf, c)
-    else                                                      ' otherwise -> [0xNN]
+    else
       strs.append_str(@linebuf, string("[0x"))
       strs.fxhex(c, 2, @tmp)
       strs.append_str(@linebuf, @tmp)
       strs.append_char(@linebuf, "]")
 
   debug(zstr_(@linebuf))
-
-
-dat { transparent forwarder + frame assembler (PASM2) }
-
-              org       0
-
-'' On entry PTRA = @mbox.  Forwards each received byte immediately (send-first,
-'' so the async-TX smart pin never deadlocks -- see Stage 1), and assembles the
-'' byte stream into complete rxframe structs written to the ring.
-''
-'' Per-direction assembly state is kept in b_* / h_* registers; frameByte loads
-'' the current direction's state into cur*, runs one shared code path, and saves
-'' it back -- no register-indexing tricks.
-
-forwarder     mov       adr_wr, ptra
-              add       adr_wr, #4                              ' &mbox[1] wr_idx
-              mov       t0, ptra
-              add       t0, #8
-              rdlong    ringbase, t0                            ' mbox[2] @ring
-              mov       adr_ms, ptra
-              add       adr_ms, #12                             ' &mbox[3] ms_pub
-              mov       t0, ptra
-              add       t0, #16
-              rdlong    stagebase, t0                           ' mbox[4] @stage
-              rdlong    bitmode, ptra                           ' mbox[0]
-              mov       maskv, ##RING_MASK
-              mov       wrx, #0
-              wrlong    wrx, adr_wr
-
-              ' ---- receive smart pins (P1 body-in, P3 head-in) ----
-              fltl      #PIN_BODY_IN
-              wrpin     ##P_ASYNC_RX, #PIN_BODY_IN
-              wxpin     bitmode, #PIN_BODY_IN
-              drvl      #PIN_BODY_IN
-
-              fltl      #PIN_HEAD_IN
-              wrpin     ##P_ASYNC_RX, #PIN_HEAD_IN
-              wxpin     bitmode, #PIN_HEAD_IN
-              drvl      #PIN_HEAD_IN
-
-              ' ---- transmit smart pins (P0 head-out, P2 body-out), slew-limited ----
-              ' Gentle 1.5k drive so TX edges don't couple into the adjacent RX pin
-              ' (P0<->P1, P2<->P3).  Still ~30ns edges << 17.4us bit time.
-              fltl      #PIN_HEAD_OUT
-              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_HEAD_OUT
-              wxpin     bitmode, #PIN_HEAD_OUT
-              drvl      #PIN_HEAD_OUT
-
-              fltl      #PIN_BODY_OUT
-              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_BODY_OUT
-              wxpin     bitmode, #PIN_BODY_OUT
-              drvl      #PIN_BODY_OUT
-
-fwd_loop
-              ' ---- BODY -> HEAD ----
-              testp     #PIN_BODY_IN            wc              ' C = byte available?
-        if_nc jmp       #.chk_head
-              rdpin     rxb, #PIN_BODY_IN                       ' read + acknowledge
-              shr       rxb, #24                                ' byte -> bits[7:0]
-              wypin     rxb, #PIN_HEAD_OUT                      ' forward now (passthrough)
-              mov       curdir, #DIR_BODY
-              call      #frameByte
-
-.chk_head
-              ' ---- HEAD -> BODY ----
-              testp     #PIN_HEAD_IN            wc
-        if_nc jmp       #fwd_loop
-              rdpin     rxb, #PIN_HEAD_IN
-              shr       rxb, #24
-              wypin     rxb, #PIN_BODY_OUT                      ' forward now (passthrough)
-              mov       curdir, #DIR_HEAD
-              call      #frameByte
-
-              jmp       #fwd_loop
-
-'' frameByte -- fold rxb (direction=curdir) into that direction's staging frame;
-'' commit a complete rxframe to the ring on a terminator / standalone byte.
-frameByte
-              ' load working state for curdir
-              cmp       curdir, #DIR_BODY      wz
-        if_z  mov       curlen, b_len
-        if_nz mov       curlen, h_len
-        if_z  mov       curms, b_ms
-        if_nz mov       curms, h_ms
-        if_z  mov       curattr, b_attr
-        if_nz mov       curattr, h_attr
-
-              cmp       rxb, #$0D              wz               ' 0x0D ?
-        if_z  jmp       #.fb_cr
-              cmp       rxb, #$FF              wz               ' 0xFF ?
-        if_nz jmp       #.fb_normal
-              tjnz      curlen, #.fb_normal                    ' 0xFF mid-frame = payload byte
-              mov       cAttr, #ATTR_KEEPALIVE                 ' standalone keepalive
-              jmp       #.fb_single
-
-.fb_cr        tjnz      curlen, #.fb_term                      ' 0x0D mid-frame = terminator
-              mov       cAttr, #ATTR_CR                        ' standalone sync poll
-
-.fb_single    rdlong    cMs, adr_ms                            ' receive time (published ms)
-              mov       stgadr, curdir
-              shl       stgadr, #6                             ' curdir * MAXPAY (64)
-              add       stgadr, stagebase
-              wrbyte    rxb, stgadr                            ' payload[0] = rxb
-              mov       cLen, #1
-              mov       cDir, curdir
-              mov       cSrc, stgadr
-              call      #commit
-              mov       curlen, #0
-              jmp       #.fb_done
-
-.fb_term      mov       cLen, curlen                           ' terminator -> commit accumulated frame
-              mov       cAttr, curattr
-              mov       cMs, curms
-              mov       stgadr, curdir
-              shl       stgadr, #6
-              add       stgadr, stagebase
-              mov       cDir, curdir
-              mov       cSrc, stgadr
-              call      #commit
-              mov       curlen, #0
-              jmp       #.fb_done
-
-.fb_normal    tjnz      curlen, #.fb_append                    ' not first byte -> just append
-              rdlong    curms, adr_ms                          ' frame start: record ms, clear attr
-              mov       curattr, #0
-.fb_append    mov       stgadr, curdir
-              shl       stgadr, #6
-              add       stgadr, stagebase
-              add       stgadr, curlen                         ' &stage[curdir][curlen]
-              wrbyte    rxb, stgadr
-              add       curlen, #1
-              cmp       curlen, #MAXPAY        wc              ' reached MAXPAY without terminator?
-        if_ae jmp       #.fb_trunc
-              jmp       #.fb_done
-
-.fb_trunc     mov       cLen, curlen                           ' commit truncated frame
-              mov       cAttr, curattr
-              or        cAttr, #ATTR_TRUNC
-              mov       cMs, curms
-              mov       stgadr, curdir
-              shl       stgadr, #6
-              add       stgadr, stagebase
-              mov       cDir, curdir
-              mov       cSrc, stgadr
-              call      #commit
-              mov       curlen, #0
-
-.fb_done      ' save working state back for curdir
-              cmp       curdir, #DIR_BODY      wz
-        if_z  mov       b_len, curlen
-        if_nz mov       h_len, curlen
-        if_z  mov       b_ms, curms
-        if_nz mov       h_ms, curms
-        if_z  mov       b_attr, curattr
-        if_nz mov       h_attr, curattr
-              ret
-
-'' commit -- write one rxframe {cDir,cLen,cAttr,cMs, payload<-cSrc} into ring[wrx],
-'' then advance and publish wrx.  Entry stride and field offsets follow the packed
-'' struct layout (dir@0 len@1 attr@2 ms@4 payload@8, sizeof = FRAME_BYTES = 72).
-commit        mov       hubp, wrx
-              and       hubp, maskv                            ' entry index 0..RING_MASK
-              mov       t0, hubp
-              shl       t0, #6                                 ' idx * 64
-              shl       hubp, #3                               ' idx * 8
-              add       hubp, t0                               ' idx * 72
-              add       hubp, ringbase                         ' &ring[wrx]
-
-              wrbyte    cDir, hubp                             ' +0  dir
-              add       hubp, #1
-              wrbyte    cLen, hubp                             ' +1  len
-              add       hubp, #1
-              wrword    cAttr, hubp                            ' +2  attr (little-endian WORD)
-              add       hubp, #2
-              wrlong    cMs, hubp                              ' +4  ms   (little-endian LONG)
-              add       hubp, #4                               ' -> payload (+8)
-
-              mov       ci, #0                                 ' copy cLen payload bytes
-.cpy          cmp       ci, cLen               wz
-        if_z  jmp       #.cpydone
-              rdbyte    val, cSrc
-              wrbyte    val, hubp
-              add       cSrc, #1
-              add       hubp, #1
-              add       ci, #1
-              jmp       #.cpy
-.cpydone
-              add       wrx, #1
-              wrlong    wrx, adr_wr                            ' publish new write index
-              ret
-
-' ---- initialised per-direction assembly length (must be 0 at start) ----
-b_len         long      0                                      ' body: staged payload length
-h_len         long      0                                      ' head: staged payload length
-
-' ---- cog registers (scratch / set before use) ----
-bitmode       res       1
-adr_wr        res       1                                      ' hub &mbox[1]
-ringbase      res       1                                      ' hub @ring
-adr_ms        res       1                                      ' hub &mbox[3] (ms_pub)
-stagebase     res       1                                      ' hub @stage
-maskv         res       1                                      ' RING_MASK
-wrx           res       1                                      ' producer index (frames)
-rxb           res       1                                      ' received byte
-curdir        res       1                                      ' direction of current byte
-b_ms          res       1                                      ' body: frame-start ms
-h_ms          res       1                                      ' head: frame-start ms
-b_attr        res       1                                      ' body: attr accumulator
-h_attr        res       1                                      ' head: attr accumulator
-curlen        res       1                                      ' working: current length
-curms         res       1                                      ' working: frame-start ms
-curattr       res       1                                      ' working: attr
-stgadr        res       1                                      ' scratch stage address
-cDir          res       1                                      ' commit args...
-cLen          res       1
-cAttr         res       1
-cMs           res       1
-cSrc          res       1
-hubp          res       1                                      ' commit: scratch hub address
-ci            res       1                                      ' commit: copy index
-val           res       1                                      ' commit: copy byte
-t0            res       1                                      ' scratch
-
-              fit
