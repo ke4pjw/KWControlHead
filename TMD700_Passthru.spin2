@@ -1,0 +1,121 @@
+'' =================================================================================================
+''
+''   File....... TMD700_Passthru.spin2
+''   Purpose.... MINIMAL transparent passthrough for the TM-D700 head<->body link,
+''              plus a once-per-second byte-count heartbeat over DEBUG so we can see
+''              that the P2 is alive and which directions are carrying traffic.
+''              No ring, no framing -- just byte-exact relay both directions.
+''   Target..... P2, spinc.exe  (build/run:  spinc -p <port> -d -t -r TMD700_Passthru.spin2)
+''
+''   Wiring (Terry's inline tap):
+''     P0 HEAD_OUT  TX -> control head RX
+''     P1 BODY_IN   RX <- RF deck TX
+''     P2 BODY_OUT  TX -> RF deck RX
+''     P3 HEAD_IN   RX <- control head TX
+''   Radio link: 57600 8N1, idle-high, CMOS 3.3V.
+''
+'' =================================================================================================
+
+
+con
+
+  _clkfreq = 200_000_000
+
+  BAUD_RADIO   = 57_600
+
+  PIN_HEAD_OUT = 0
+  PIN_BODY_IN  = 1
+  PIN_BODY_OUT = 2
+  PIN_HEAD_IN  = 3
+
+
+var
+
+  long  mbox[3]                                                ' [0]=bitmode [1]=count body->head [2]=count head->body
+
+
+pub main() | b2h, h2b
+
+  mbox[0] := muldiv64(clkfreq, $1_0000, BAUD_RADIO) & $FFFF_FC00
+  mbox[0] |= 7
+  mbox[1] := 0
+  mbox[2] := 0
+
+  coginit(COGEXEC_NEW, @forwarder, @mbox)
+
+  debug("TM-D700 passthrough (minimal)  -- watch counts move when you press radio power")
+
+  repeat
+    waitms(1000)
+    b2h := mbox[1]
+    h2b := mbox[2]
+    debug("bytes  BODY->HEAD=", udec_(b2h), "   HEAD->BODY=", udec_(h2b))
+
+
+dat { transparent byte forwarder (PASM2) }
+
+              org       0
+
+'' PTRA = @mbox.  Configure the four smart pins, then relay every received byte to
+'' the opposite side immediately, counting each into the mailbox for the heartbeat.
+
+forwarder     mov       adr_b2h, ptra
+              add       adr_b2h, #4                             ' &mbox[1]
+              mov       adr_h2b, ptra
+              add       adr_h2b, #8                             ' &mbox[2]
+              rdlong    bmode, ptra                             ' mbox[0]
+              mov       cnt_b2h, #0
+              mov       cnt_h2b, #0
+
+              ' ---- receive smart pins (P1 body-in, P3 head-in) ----
+              fltl      #PIN_BODY_IN
+              wrpin     ##P_ASYNC_RX, #PIN_BODY_IN
+              wxpin     bmode, #PIN_BODY_IN
+              drvl      #PIN_BODY_IN
+
+              fltl      #PIN_HEAD_IN
+              wrpin     ##P_ASYNC_RX, #PIN_HEAD_IN
+              wxpin     bmode, #PIN_HEAD_IN
+              drvl      #PIN_HEAD_IN
+
+              ' ---- transmit smart pins (P0 head-out, P2 body-out), slew-limited 1.5k ----
+              fltl      #PIN_HEAD_OUT
+              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_HEAD_OUT
+              wxpin     bmode, #PIN_HEAD_OUT
+              drvl      #PIN_HEAD_OUT
+
+              fltl      #PIN_BODY_OUT
+              wrpin     ##(P_ASYNC_TX | P_OE | P_HIGH_1K5 | P_LOW_1K5), #PIN_BODY_OUT
+              wxpin     bmode, #PIN_BODY_OUT
+              drvl      #PIN_BODY_OUT
+
+fwd_loop
+              ' body -> head
+              testp     #PIN_BODY_IN            wc
+        if_nc jmp       #.chk_head
+              rdpin     d, #PIN_BODY_IN
+              shr       d, #24
+              wypin     d, #PIN_HEAD_OUT
+              add       cnt_b2h, #1
+              wrlong    cnt_b2h, adr_b2h
+
+.chk_head
+              ' head -> body
+              testp     #PIN_HEAD_IN            wc
+        if_nc jmp       #fwd_loop
+              rdpin     d, #PIN_HEAD_IN
+              shr       d, #24
+              wypin     d, #PIN_BODY_OUT
+              add       cnt_h2b, #1
+              wrlong    cnt_h2b, adr_h2b
+
+              jmp       #fwd_loop
+
+bmode         res       1
+adr_b2h       res       1
+adr_h2b       res       1
+cnt_b2h       res       1
+cnt_h2b       res       1
+d             res       1
+
+              fit
