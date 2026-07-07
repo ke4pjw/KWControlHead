@@ -327,16 +327,18 @@ Used for both Tone (T) and CTCSS (CT) modes. Index is the value in `P8 NN`/`Q8 N
 
 ---
 
-## Appendix B — Complete DCS Code List (101 codes)
+## Appendix B — Complete DCS Code List (104 codes)
 
-Captured by scrolling through all codes during Scenario 7 Band B. Displayed in `N`/`O` as a 3-digit code during DCS selection mode.
+Displayed in `N`/`O` as a 3-digit code during DCS selection mode. Originally captured (101 codes)
+by scrolling through Scenario 7 Band B; validated 2026-07-06 against the full manual table, which
+added **174, 225, 431** (missed during the scroll capture) for the complete set of 104.
 
 ```
 023 025 026 031 032 036 043 047 051 053 054 065 071 072 073 074
-114 115 116 122 125 131 132 134 143 145 152 155 156 162 165 172
-205 212 223 226 243 244 245 246 251 252 255 261 263 265 266 271 274
+114 115 116 122 125 131 132 134 143 145 152 155 156 162 165 172 174
+205 212 223 225 226 243 244 245 246 251 252 255 261 263 265 266 271 274
 306 311 315 325 331 332 343 346 351 356 364 365 371
-411 412 413 423 432 445 446 452 454 455 462 464 465 466
+411 412 413 423 431 432 445 446 452 454 455 462 464 465 466
 503 506 516 523 526 532 546 565
 606 612 624 627 631 632 654 662 664
 703 712 723 731 732 734 743 754
